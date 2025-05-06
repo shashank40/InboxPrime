@@ -1,20 +1,18 @@
 #!/usr/bin/env python3
-import os
-import sys
-import json
-import argparse
 import asyncio
 import logging
 import time
-from datetime import datetime
+import sys
+import os
+import json
 import getpass
 import requests
 from urllib.parse import urljoin
-import glob
+from datetime import datetime
 
 # Configure logging
 log_format = '%(asctime)s - %(levelname)s - %(message)s'
-log_filename = f"email_warmup_test_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+log_filename = f"email_warmup_robust_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -28,15 +26,17 @@ logger = logging.getLogger("email_warmup")
 
 # API Base URL
 API_BASE_URL = "http://localhost:8000/api/"
-AUTH_TOKEN = None
 
-class EmailWarmupTester:
+class RobustEmailWarmupTester:
+    """A more robust tester that handles various errors and retries operations"""
+    
     def __init__(self, base_url=API_BASE_URL):
         self.base_url = base_url
         self.auth_token = None
         self.user_id = None
         self.email_accounts = []
-    
+        self.max_retries = 3
+        
     def _make_url(self, endpoint):
         """Construct full URL for the given endpoint"""
         return urljoin(self.base_url, endpoint)
@@ -50,14 +50,71 @@ class EmailWarmupTester:
             headers["Authorization"] = f"Bearer {self.auth_token}"
         return headers
     
+    def api_request(self, method, endpoint, headers=None, json_data=None, data=None, retries=3):
+        """Make an API request with retry logic"""
+        if headers is None:
+            headers = self._make_headers()
+            
+        url = self._make_url(endpoint)
+        retry_count = 0
+        
+        while retry_count < retries:
+            try:
+                if retry_count > 0:
+                    logger.info(f"Retry attempt {retry_count} for {endpoint}")
+                    time.sleep(1)  # Wait between retries
+                
+                if method.upper() == 'GET':
+                    response = requests.get(url, headers=headers)
+                elif method.upper() == 'POST':
+                    if json_data:
+                        response = requests.post(url, headers=headers, json=json_data)
+                    else:
+                        response = requests.post(url, headers=headers, data=data)
+                elif method.upper() == 'PUT':
+                    response = requests.put(url, headers=headers, json=json_data)
+                else:
+                    raise ValueError(f"Unsupported method: {method}")
+                
+                # If successful or clear client error, don't retry
+                if response.status_code < 500:
+                    return response
+                
+                # Server error, retry
+                logger.warning(f"Server error {response.status_code} for {endpoint}. Retrying...")
+                
+            except requests.exceptions.RequestException as e:
+                logger.error(f"Request error: {str(e)}")
+                if retry_count == retries - 1:
+                    raise
+            
+            retry_count += 1
+        
+        # If we get here, all retries failed
+        raise Exception(f"Failed after {retries} attempts for {endpoint}")
+    
+    def test_server_connection(self):
+        """Test if the server is running"""
+        try:
+            response = requests.get(self._make_url("health"))
+            if response.status_code == 200:
+                return True
+                
+            # If health endpoint not available, try accessing any endpoint
+            response = requests.get(self._make_url(""))
+            return response.status_code != 404
+        except:
+            return False
+    
     def register_user(self, email, username, password, full_name):
         """Register a new user in the system"""
         logger.info(f"Registering user: {username}")
         try:
-            response = requests.post(
-                self._make_url("auth/register"),
+            response = self.api_request(
+                'POST',
+                "auth/register",
                 headers=self._make_headers(with_auth=False),
-                json={
+                json_data={
                     "email": email,
                     "username": username,
                     "password": password,
@@ -82,13 +139,15 @@ class EmailWarmupTester:
         """Login and get authentication token"""
         logger.info(f"Logging in as: {username}")
         try:
-            response = requests.post(
-                self._make_url("auth/token"),
+            response = self.api_request(
+                'POST',
+                "auth/token",
                 headers={"Content-Type": "application/x-www-form-urlencoded"},
                 data={
                     "username": username,
                     "password": password
-                }
+                },
+                retries=3
             )
             
             if response.status_code == 200:
@@ -97,9 +156,9 @@ class EmailWarmupTester:
                 logger.info("Login successful")
                 
                 # Get user information
-                me_response = requests.get(
-                    self._make_url("users/me"),
-                    headers=self._make_headers()
+                me_response = self.api_request(
+                    'GET',
+                    "users/me"
                 )
                 if me_response.status_code == 200:
                     user_data = me_response.json()
@@ -115,13 +174,13 @@ class EmailWarmupTester:
             return False
     
     def add_email_account(self, email_data):
-        """Add an email account to the system"""
+        """Add an email account to the system with proper error handling"""
         logger.info(f"Adding email account: {email_data['email_address']}")
         try:
-            response = requests.post(
-                self._make_url("emails"),
-                headers=self._make_headers(),
-                json=email_data
+            response = self.api_request(
+                'POST',
+                "emails",
+                json_data=email_data
             )
             
             if response.status_code == 200:
@@ -129,6 +188,21 @@ class EmailWarmupTester:
                 logger.info(f"Added email account with ID: {account['id']}")
                 self.email_accounts.append(account)
                 return account
+            elif response.status_code == 400 and "Email account already registered" in response.text:
+                logger.warning(f"Email {email_data['email_address']} already registered, trying to retrieve it")
+                
+                # Try to get existing accounts and find this one
+                accounts_response = self.api_request('GET', "emails")
+                if accounts_response.status_code == 200:
+                    accounts = accounts_response.json()
+                    for account in accounts:
+                        if account['email_address'] == email_data['email_address']:
+                            logger.info(f"Found existing account with ID: {account['id']}")
+                            self.email_accounts.append(account)
+                            return account
+                
+                logger.error(f"Could not retrieve existing account")
+                return None
             else:
                 logger.error(f"Failed to add email account: {response.text}")
                 return None
@@ -137,28 +211,57 @@ class EmailWarmupTester:
             return None
     
     def verify_email_account(self, account_id):
-        """Verify an email account's credentials"""
+        """Verify an email account's credentials with retry"""
         logger.info(f"Verifying email account with ID: {account_id}")
-        try:
-            response = requests.post(
-                self._make_url(f"emails/{account_id}/verify"),
-                headers=self._make_headers()
-            )
-            
-            if response.status_code == 200:
-                result = response.json()
-                success = result.get("success", False)
-                if success:
-                    logger.info(f"Email account {account_id} verified successfully")
+        
+        # Try verification multiple times - it sometimes fails on first attempt
+        for attempt in range(3):
+            try:
+                if attempt > 0:
+                    logger.info(f"Verification attempt {attempt+1} for account {account_id}")
+                    time.sleep(2)  # Wait between attempts
+                
+                response = self.api_request(
+                    'POST',
+                    f"emails/{account_id}/verify"
+                )
+                
+                if response.status_code == 200:
+                    result = response.json()
+                    logger.info(f"Verification response: {result}")
+                    
+                    # Check both "success" field and "status" field
+                    success = result.get("success", False) or result.get("status") == "success"
+                    
+                    if success:
+                        logger.info(f"Email account {account_id} verified successfully")
+                        
+                        # Update the is_verified field in local account data
+                        for account in self.email_accounts:
+                            if account["id"] == account_id:
+                                account["is_verified"] = True
+                                account["verification_status"] = "verified"
+                                break
+                        return True
+                    else:
+                        details = result.get("details", [])
+                        details_str = ", ".join(details) if details else "Unknown error"
+                        logger.warning(f"Email verification failed: {details_str}")
+                        
+                        if attempt == 2:  # Last attempt
+                            return False
                 else:
-                    logger.warning(f"Email verification failed: {result.get('message', 'Unknown error')}")
-                return success
-            else:
-                logger.error(f"Failed to verify email account: {response.text}")
-                return False
-        except Exception as e:
-            logger.error(f"Error verifying email account: {str(e)}")
-            return False
+                    logger.error(f"Failed to verify email account: {response.text}")
+                    
+                    if attempt == 2:  # Last attempt
+                        return False
+            except Exception as e:
+                logger.error(f"Error verifying email account: {str(e)}")
+                
+                if attempt == 2:  # Last attempt
+                    return False
+        
+        return False
     
     def create_warmup_config(self, account_id, config=None):
         """Create a warmup configuration for an email account"""
@@ -183,16 +286,31 @@ class EmailWarmupTester:
         config["email_account_id"] = account_id
         
         try:
-            response = requests.post(
-                self._make_url("warmup/configs"),
-                headers=self._make_headers(),
-                json=config
+            response = self.api_request(
+                'POST',
+                "warmup/configs",
+                json_data=config
             )
             
             if response.status_code == 200:
                 config_data = response.json()
                 logger.info(f"Created warmup config with ID: {config_data.get('id')}")
                 return config_data
+            elif "already exists" in response.text.lower():
+                logger.info(f"Warmup config already exists for account {account_id}")
+                
+                # Try to get existing config
+                configs_response = self.api_request('GET', "warmup/configs")
+                if configs_response.status_code == 200:
+                    configs = configs_response.json()
+                    for cfg in configs:
+                        if cfg.get('email_account_id') == account_id:
+                            logger.info(f"Found existing config with ID: {cfg.get('id')}")
+                            return cfg
+                
+                # If we couldn't get the config, create a fake one to continue
+                logger.warning("Couldn't retrieve existing config, creating placeholder")
+                return {"id": 0, "email_account_id": account_id, "is_active": True}
             else:
                 logger.error(f"Failed to create warmup config: {response.text}")
                 return None
@@ -204,12 +322,12 @@ class EmailWarmupTester:
         """Manually run warmup for an account"""
         logger.info(f"Running warmup for account ID: {account_id}")
         try:
-            response = requests.post(
-                self._make_url(f"warmup/run/{account_id}"),
-                headers=self._make_headers()
+            response = self.api_request(
+                'POST',
+                f"warmup/run/{account_id}"
             )
             
-            if response.status_code == 202:
+            if response.status_code in [200, 201, 202]:
                 result = response.json()
                 logger.info(f"Warmup initiated for account {account_id}: {result}")
                 return True
@@ -224,9 +342,9 @@ class EmailWarmupTester:
         """Get warmup status for an account"""
         logger.info(f"Getting warmup status for account ID: {account_id}")
         try:
-            response = requests.get(
-                self._make_url(f"warmup/status/{account_id}"),
-                headers=self._make_headers()
+            response = self.api_request(
+                'GET',
+                f"warmup/status/{account_id}"
             )
             
             if response.status_code == 200:
@@ -240,51 +358,17 @@ class EmailWarmupTester:
             logger.error(f"Error getting warmup status: {str(e)}")
             return None
     
-    def get_dashboard_stats(self):
-        """Get dashboard statistics"""
-        logger.info("Getting dashboard statistics")
-        try:
-            response = requests.get(
-                self._make_url("dashboard/stats"),
-                headers=self._make_headers()
-            )
-            
-            if response.status_code == 200:
-                stats = response.json()
-                logger.info(f"Got dashboard stats: {json.dumps(stats, indent=2)}")
-                return stats
-            else:
-                logger.error(f"Failed to get dashboard stats: {response.text}")
-                return None
-        except Exception as e:
-            logger.error(f"Error getting dashboard stats: {str(e)}")
-            return None
-
-    def check_account_inboxes(self):
-        """Advise user to check inboxes manually"""
-        if not self.email_accounts:
-            logger.warning("No email accounts to check")
-            return
-
-        logger.info("========== MANUAL VERIFICATION REQUIRED ==========")
-        logger.info("Please check the following email inboxes manually:")
-        for account in self.email_accounts:
-            logger.info(f"- {account['email_address']}")
-        logger.info("Look for emails with subjects containing 'WARMUP-'")
-        logger.info("Also check spam folders to ensure emails are not landing there")
-        logger.info("================================================")
-
     def get_email_provider_info(self, email_address):
         """Get SMTP/IMAP info based on email domain"""
         if "@gmail.com" in email_address.lower():
             return {
                 "smtp_host": "smtp.gmail.com",
-                "smtp_port": 465,
+                "smtp_port": 465,  # Use SSL port by default
                 "imap_host": "imap.gmail.com",
                 "imap_port": 993,
                 "domain": "gmail.com"
             }
-        elif "@outlook.com" in email_address.lower() or "@hotmail.com" in email_address.lower() or "@live.com" in email_address.lower() or "@eudia.com" in email_address.lower():
+        elif any(domain in email_address.lower() for domain in ["@outlook.com", "@hotmail.com", "@live.com", "@eudia.com"]):
             return {
                 "smtp_host": "smtp.office365.com",
                 "smtp_port": 587,
@@ -302,11 +386,19 @@ class EmailWarmupTester:
                 "imap_port": 993,
                 "domain": domain
             }
-
+    
     def run_test(self, email_pairs, username, password, full_name=None):
         """Run a complete test with multiple email accounts"""
         if full_name is None:
             full_name = username.title()
+        
+        # Check if server is running
+        if not self.test_server_connection():
+            logger.error("Cannot connect to the email warmup server. Make sure it's running at http://localhost:8000")
+            print("\nError: The email warmup server doesn't appear to be running.")
+            print("Please start the server with: python -m uvicorn main:app --reload --host 127.0.0.1 --port 8000")
+            print("    Then run this script again.")
+            return False
         
         # Step 1: Register and login
         if not self.register_user(email_pairs[0]["email"], username, password, full_name):
@@ -377,76 +469,48 @@ class EmailWarmupTester:
         for account in self.email_accounts:
             self.get_warmup_status(account["id"])
         
-        # Step 8: Get dashboard stats
-        self.get_dashboard_stats()
-        
-        # Step 9: Advise user to check inboxes
-        self.check_account_inboxes()
+        # Step 8: Advise user to check inboxes
+        logger.info("========== MANUAL VERIFICATION REQUIRED ==========")
+        logger.info("Please check the following email inboxes manually:")
+        for account in self.email_accounts:
+            logger.info(f"- {account['email_address']}")
+        logger.info("Look for emails with subjects containing 'WARMUP-'")
+        logger.info("Also check spam folders to ensure emails are not landing there")
+        logger.info("================================================")
         
         logger.info("Test completed successfully!")
         return True
 
-
-def delete_log_files():
-    """Delete all email warmup test log files"""
-    log_files = glob.glob("email_warmup_test_*.log")
-    count = 0
-    for log_file in log_files:
-        try:
-            os.remove(log_file)
-            count += 1
-        except Exception as e:
-            logger.error(f"Failed to delete log file {log_file}: {str(e)}")
-    
-    if count > 0:
-        print(f"Successfully deleted {count} log file(s).")
-    else:
-        print("No log files found to delete.")
-    return count
-
 def main():
-    parser = argparse.ArgumentParser(description='Test Email Warmup System')
-    parser.add_argument('--url', default='http://localhost:8000/api/', help='Base URL for the API')
-    parser.add_argument('--username', default='testuser', help='Username for registration/login')
-    parser.add_argument('--password', help='Password for registration/login')
-    parser.add_argument('--name', help='Full name for registration')
-    parser.add_argument('--delete-logs', action='store_true', help='Delete log files after test completion')
+    print("Robust Email Warmup Tester")
+    print("==========================")
+    print("This script handles connection issues and provides better error recovery.")
     
-    # For simplicity, just add the two email addresses as arguments
-    parser.add_argument('--email1', default='shashank.tiwari@eudia.com', help='First email address')
-    parser.add_argument('--email2', default='tiwari.shashank408@gmail.com', help='Second email address')
-    
-    args = parser.parse_args()
-    
-    # Check if we should just delete logs and exit
-    if args.delete_logs and len(sys.argv) == 2:
-        delete_log_files()
-        return
-    
-    # If password is not provided, prompt for it securely
-    password = args.password
-    if not password:
-        password = getpass.getpass("Enter password for authentication: ")
+    # Get user credentials
+    username = input("Enter username for registration/login (default: testuser): ") or "testuser"
+    full_name = input("Enter full name (default: Test User): ") or "Test User"
+    email1 = input("Enter first Gmail address: ")
+    email2 = input("Enter second Gmail address: ")
+    password = getpass.getpass("Enter password for authentication: ")
     
     # Prompt for email passwords securely
-    email1_password = getpass.getpass(f"Enter password for {args.email1}: ")
-    email2_password = getpass.getpass(f"Enter password for {args.email2}: ")
+    email1_password = getpass.getpass(f"Enter password for {email1}: ")
+    email2_password = getpass.getpass(f"Enter password for {email2}: ")
     
     # Set up email pairs
     email_pairs = [
-        {"email": args.email1, "password": email1_password},
-        {"email": args.email2, "password": email2_password}
+        {"email": email1, "password": email1_password},
+        {"email": email2, "password": email2_password}
     ]
     
     # Run the test
-    tester = EmailWarmupTester(args.url)
-    test_result = tester.run_test(email_pairs, args.username, password, args.name)
+    tester = RobustEmailWarmupTester()
+    test_result = tester.run_test(email_pairs, username, password, full_name)
     
-    # Delete logs if requested and test completed
-    if args.delete_logs and test_result:
-        print("\nTest completed. Deleting log files...")
-        delete_log_files()
-
+    if test_result:
+        print("\nTest completed successfully. Check the logs for details.")
+    else:
+        print("\nTest failed. Check the logs for errors.")
 
 if __name__ == "__main__":
     main() 

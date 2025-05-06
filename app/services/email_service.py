@@ -24,51 +24,163 @@ class EmailService:
     @staticmethod
     async def verify_smtp_connection(email_account: EmailAccount) -> bool:
         """Verify SMTP connection credentials"""
+        connection_error = None
+        
         try:
             context = ssl.create_default_context()
             
-            # Connect to the SMTP server
+            # First try: If port is 465, use SSL from the start
             if email_account.smtp_port == 465:
-                # Port 465 uses SSL from the start
-                smtp = aiosmtplib.SMTP_SSL(
-                    hostname=email_account.smtp_host,
-                    port=email_account.smtp_port,
-                    ssl_context=context
-                )
-                await smtp.connect()
-            else:
-                # Port 587 uses STARTTLS
+                try:
+                    smtp = aiosmtplib.SMTP(
+                        hostname=email_account.smtp_host,
+                        port=email_account.smtp_port,
+                        use_tls=True,
+                        tls_context=context
+                    )
+                    await smtp.connect()
+                    await smtp.login(email_account.smtp_username, email_account.smtp_password)
+                    await smtp.quit()
+                    return True
+                except Exception as e:
+                    logger.error(f"SMTP SSL connection failed: {str(e)}")
+                    logger.error(f"Trying alternative SMTP method...")
+                    connection_error = e
+                    # Don't return here - fall through to try STARTTLS
+            
+            # Second try: Use STARTTLS (common fallback for Gmail)
+            try:
+                # Create a new event loop for this connection attempt
+                # This helps prevent the "Event loop is closed" error
                 smtp = aiosmtplib.SMTP(
                     hostname=email_account.smtp_host,
-                    port=email_account.smtp_port,
-                    use_tls=False
+                    port=587,  # Use standard STARTTLS port
+                    use_tls=False,
+                    timeout=30  # Set an explicit timeout
                 )
-                await smtp.connect()
-                await smtp.starttls(tls_context=context)
-            
-            await smtp.login(email_account.smtp_username, email_account.smtp_password)
-            await smtp.quit()
-            return True
+                
+                try:
+                    await smtp.connect()
+                    await smtp.starttls(tls_context=context)
+                    await smtp.login(email_account.smtp_username, email_account.smtp_password)
+                    await smtp.quit()
+                    
+                    # If we succeed with STARTTLS, update the port setting for future use
+                    email_account.smtp_port = 587
+                    
+                    return True
+                except Exception as e:
+                    logger.error(f"SMTP STARTTLS verification failed: {str(e)}")
+                    logger.error(f"Exception type: {type(e).__name__}")
+                    logger.error(f"Full exception details: {repr(e)}")
+                    if connection_error is None:
+                        connection_error = e
+            except Exception as e:
+                logger.error(f"Failed to create SMTP connection: {str(e)}")
+                if connection_error is None:
+                    connection_error = e
+                
         except Exception as e:
             logger.error(f"SMTP verification failed: {str(e)}")
-            return False
+            logger.error(f"Exception type: {type(e).__name__}")
+            logger.error(f"Full exception details: {repr(e)}")
+            connection_error = e
+        
+        # If we get here, both methods failed
+        if connection_error:
+            # Check if the error is related to event loop issues
+            error_text = str(connection_error).lower()
+            if "event loop" in error_text or "closed" in error_text or "ssl" in error_text:
+                logger.error("Detected event loop or SSL error. This is often transient.")
+            
+            # Check for specific authentication errors
+            if "authentication" in error_text or "credentials" in error_text or "password" in error_text:
+                logger.error("This appears to be an authentication error. Please check your username and password.")
+            
+        return False
     
     @staticmethod
     async def verify_imap_connection(email_account: EmailAccount) -> bool:
         """Verify IMAP connection credentials"""
+        connection_error = None
+        
         try:
             # Connect to the IMAP server
-            imap = aioimaplib.IMAP4_SSL(
-                host=email_account.imap_host,
-                port=email_account.imap_port
-            )
-            await imap.wait_hello_from_server()
-            await imap.login(email_account.imap_username, email_account.imap_password)
-            await imap.logout()
-            return True
+            try:
+                imap = aioimaplib.IMAP4_SSL(
+                    host=email_account.imap_host,
+                    port=email_account.imap_port,
+                    timeout=30  # Set explicit timeout
+                )
+                await imap.wait_hello_from_server()
+                await imap.login(email_account.imap_username, email_account.imap_password)
+                
+                # Try to select INBOX to verify full functionality
+                try:
+                    _, data = await imap.select('INBOX')
+                    if data[0] != b'OK':
+                        logger.error(f"IMAP inbox selection failed: {data}")
+                        raise Exception("Could not select INBOX")
+                except Exception as e:
+                    logger.warning(f"IMAP INBOX selection failed: {str(e)}")
+                    # Continue even if INBOX selection fails
+                    
+                await imap.logout()
+                return True
+            except Exception as e:
+                logger.error(f"IMAP standard verification failed: {str(e)}")
+                logger.error(f"Exception type: {type(e).__name__}")
+                logger.error(f"Full exception details: {repr(e)}")
+                connection_error = e
+                
+                # Check if it's a Gmail account and try with special folder naming
+                if "gmail" in email_account.imap_host.lower():
+                    try:
+                        logger.info("Trying Gmail-specific IMAP approach...")
+                        imap = aioimaplib.IMAP4_SSL(
+                            host=email_account.imap_host,
+                            port=email_account.imap_port,
+                            timeout=30  # Set explicit timeout
+                        )
+                        await imap.wait_hello_from_server()
+                        await imap.login(email_account.imap_username, email_account.imap_password)
+                        
+                        # Try just listing folders instead of selecting INBOX
+                        try:
+                            _, data = await imap.list('', '*')
+                            if data:
+                                logger.info(f"Gmail IMAP folder listing successful")
+                                await imap.logout()
+                                return True
+                        except Exception as folder_e:
+                            logger.warning(f"Gmail folder listing failed: {str(folder_e)}")
+                            # Continue even if folder listing fails
+                        
+                        await imap.logout()
+                        return True
+                    except Exception as e2:
+                        logger.error(f"Gmail-specific IMAP approach failed: {str(e2)}")
+                        if connection_error is None:
+                            connection_error = e2
+                
         except Exception as e:
             logger.error(f"IMAP verification failed: {str(e)}")
-            return False
+            logger.error(f"Exception type: {type(e).__name__}")
+            logger.error(f"Full exception details: {repr(e)}")
+            connection_error = e
+        
+        # If we get here, all methods failed
+        if connection_error:
+            # Check if the error is related to event loop issues
+            error_text = str(connection_error).lower()
+            if "event loop" in error_text or "closed" in error_text or "ssl" in error_text:
+                logger.error("Detected event loop or SSL error in IMAP. This is often transient.")
+            
+            # Check for specific authentication errors
+            if "authentication" in error_text or "credentials" in error_text or "password" in error_text:
+                logger.error("This appears to be an IMAP authentication error. Please check your username and password.")
+            
+        return False
     
     @staticmethod
     async def send_email(
@@ -79,6 +191,8 @@ class EmailService:
         body_text: str
     ) -> Tuple[bool, str, Optional[str]]:
         """Send an email and return success status, message, and message ID"""
+        connection_error = None
+        
         try:
             # Create message container
             msg = MIMEMultipart('alternative')
@@ -95,34 +209,79 @@ class EmailService:
             # Set up SSL context
             context = ssl.create_default_context()
             
-            # Connect to the SMTP server
+            # First try: If port is 465, use SSL from the start
             if sender.smtp_port == 465:
-                # Port 465 uses SSL from the start
-                smtp = aiosmtplib.SMTP_SSL(
-                    hostname=sender.smtp_host,
-                    port=sender.smtp_port,
-                    ssl_context=context
-                )
-                await smtp.connect()
-            else:
+                try:
+                    # Port 465 uses SSL from the start
+                    smtp = aiosmtplib.SMTP(
+                        hostname=sender.smtp_host,
+                        port=sender.smtp_port,
+                        use_tls=True,
+                        tls_context=context,
+                        timeout=30  # Set explicit timeout
+                    )
+                    await smtp.connect()
+                    await smtp.login(sender.smtp_username, sender.smtp_password)
+                    await smtp.send_message(msg)
+                    await smtp.quit()
+                    
+                    return True, "Email sent successfully", msg['Message-ID']
+                except Exception as e:
+                    logger.error(f"SMTP SSL send failed: {str(e)}")
+                    logger.error(f"Trying alternative SMTP method...")
+                    connection_error = e
+                    # Don't return here - fall through to try STARTTLS
+            
+            # Second try: Use STARTTLS (common fallback for Gmail)
+            try:
                 # Port 587 uses STARTTLS
                 smtp = aiosmtplib.SMTP(
                     hostname=sender.smtp_host,
-                    port=sender.smtp_port,
-                    use_tls=False
+                    port=587,  # Standard STARTTLS port
+                    use_tls=False,
+                    timeout=30  # Set explicit timeout
                 )
-                await smtp.connect()
-                await smtp.starttls(tls_context=context)
-            
-            # Send the email
-            await smtp.login(sender.smtp_username, sender.smtp_password)
-            await smtp.send_message(msg)
-            await smtp.quit()
-            
-            return True, "Email sent successfully", msg['Message-ID']
+                
+                try:
+                    await smtp.connect()
+                    await smtp.starttls(tls_context=context)
+                    await smtp.login(sender.smtp_username, sender.smtp_password)
+                    await smtp.send_message(msg)
+                    await smtp.quit()
+                    
+                    # If we succeed with STARTTLS, update the port setting for future use
+                    sender.smtp_port = 587
+                    
+                    return True, "Email sent successfully", msg['Message-ID']
+                except Exception as e:
+                    logger.error(f"Failed to send email with STARTTLS: {str(e)}")
+                    if connection_error is None:
+                        connection_error = e
+            except Exception as e:
+                logger.error(f"Failed to create SMTP connection for sending: {str(e)}")
+                if connection_error is None:
+                    connection_error = e
+                
         except Exception as e:
             logger.error(f"Failed to send email: {str(e)}")
-            return False, f"Failed to send email: {str(e)}", None
+            connection_error = e
+        
+        # If we reach this point, all attempts failed
+        error_message = "Failed to send email"
+        
+        if connection_error:
+            error_message = f"Failed to send email: {str(connection_error)}"
+            
+            # Check if the error is related to event loop issues
+            error_text = str(connection_error).lower()
+            if "event loop" in error_text or "closed" in error_text or "ssl" in error_text:
+                logger.error("Detected event loop or SSL error during send. This is often transient.")
+            
+            # Check for specific authentication errors
+            if "authentication" in error_text or "credentials" in error_text or "password" in error_text:
+                logger.error("This appears to be an authentication error during send. Please check your username and password.")
+        
+        return False, error_message, None
     
     @staticmethod
     async def check_inbox(
@@ -146,26 +305,32 @@ class EmailService:
         
         try:
             # Connect to the IMAP server
+            logger.info(f"Connecting to IMAP server for {email_account.email_address}")
             imap = aioimaplib.IMAP4_SSL(
                 host=email_account.imap_host,
                 port=email_account.imap_port
             )
             await imap.wait_hello_from_server()
             await imap.login(email_account.imap_username, email_account.imap_password)
+            logger.info(f"Successfully logged in to IMAP for {email_account.email_address}")
             
             # Check inbox
+            logger.info("Checking INBOX for warmup emails")
             await imap.select('INBOX')
             _, data = await imap.search('UTF-8', 'ALL')
             email_ids = data[0].split()
             stats["total"] = len(email_ids)
+            logger.info(f"Found {stats['total']} total emails in INBOX")
             
             # Check for unread emails
             _, data = await imap.search('UTF-8', 'UNSEEN')
             unread_ids = data[0].split()
             stats["unread"] = len(unread_ids)
+            logger.info(f"Found {stats['unread']} unread emails in INBOX")
             
             # If looking for warmup emails, process them
             if look_for_warmup_emails and email_ids:
+                logger.info("Processing emails to look for warmup emails")
                 for email_id in email_ids:
                     try:
                         _, data = await imap.fetch(email_id, '(RFC822)')
@@ -178,6 +343,7 @@ class EmailService:
                         # Look for warmup email pattern
                         if 'WARMUP-' in subject:
                             stats["warmup"] += 1
+                            logger.info(f"Found warmup email in INBOX with subject: {subject}")
                             
                             if process_replies:
                                 # Mark as read
@@ -191,36 +357,63 @@ class EmailService:
                                     "date": msg.get('Date', '')
                                 })
                     except Exception as e:
+                        logger.error(f"Error processing email: {str(e)}")
                         stats["errors"].append(str(e))
             
-            # Check spam folder for warmup emails
-            await imap.select('[Gmail]/Spam')
-            _, data = await imap.search('UTF-8', 'ALL')
-            spam_ids = data[0].split()
+            # Check common Gmail spam folder names
+            spam_folders = ['[Gmail]/Spam', 'Spam', 'Junk']
             
-            for email_id in spam_ids:
+            # Try each possible spam folder name
+            for spam_folder in spam_folders:
                 try:
-                    _, data = await imap.fetch(email_id, '(RFC822)')
-                    raw_email = data[0][1]
+                    logger.info(f"Checking {spam_folder} folder for warmup emails")
+                    select_result, _ = await imap.select(spam_folder)
                     
-                    # Parse the email
-                    msg = email.message_from_bytes(raw_email)
-                    subject = msg.get('Subject', '')
+                    if select_result != 'OK':
+                        logger.info(f"Folder {spam_folder} doesn't exist or can't be selected")
+                        continue
                     
-                    # Look for warmup email pattern
-                    if 'WARMUP-' in subject:
-                        stats["in_spam"] += 1
-                        
-                        if process_replies:
-                            # Move to inbox
-                            await imap.copy(email_id, 'INBOX')
-                            await imap.store(email_id, '+FLAGS', '\\Deleted')
-                            await imap.expunge()
+                    _, data = await imap.search('UTF-8', 'ALL')
+                    spam_ids = data[0].split()
+                    logger.info(f"Found {len(spam_ids)} emails in {spam_folder}")
+                    
+                    for email_id in spam_ids:
+                        try:
+                            _, data = await imap.fetch(email_id, '(RFC822)')
+                            raw_email = data[0][1]
+                            
+                            # Parse the email
+                            msg = email.message_from_bytes(raw_email)
+                            subject = msg.get('Subject', '')
+                            
+                            # Look for warmup email pattern
+                            if 'WARMUP-' in subject:
+                                stats["in_spam"] += 1
+                                logger.info(f"Found warmup email in spam with subject: {subject}")
+                                
+                                if process_replies:
+                                    logger.info(f"Moving email from {spam_folder} to INBOX: {subject}")
+                                    # Move to inbox
+                                    copy_result, _ = await imap.copy(email_id, 'INBOX')
+                                    if copy_result == 'OK':
+                                        # Delete from spam after successful copy
+                                        await imap.store(email_id, '+FLAGS', '\\Deleted')
+                                        expunge_result, _ = await imap.expunge()
+                                        if expunge_result == 'OK':
+                                            logger.info(f"Successfully moved email from {spam_folder} to INBOX")
+                                        else:
+                                            logger.error(f"Failed to expunge email from {spam_folder}")
+                                    else:
+                                        logger.error(f"Failed to copy email to INBOX")
+                        except Exception as e:
+                            logger.error(f"Error processing email in {spam_folder}: {str(e)}")
+                            stats["errors"].append(f"Error in {spam_folder}: {str(e)}")
                 except Exception as e:
-                    stats["errors"].append(str(e))
+                    logger.error(f"Error checking {spam_folder}: {str(e)}")
             
             # Logout
             await imap.logout()
+            logger.info(f"IMAP processing complete. Found {stats['warmup']} warmup emails in inbox and {stats['in_spam']} in spam")
             
             return stats
         except Exception as e:

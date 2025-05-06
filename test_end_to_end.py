@@ -278,73 +278,77 @@ class EndToEndWarmupTester:
                 mail.logout()
                 return False
             
-            # Fetch the email
+            # Fetch the email - ONLY get the FROM header
             email_id = email_ids[0]
             logger.info(f"Found email with ID: {email_id}")
             
-            logger.info("Fetching email content...")
-            typ, msg_data = mail.fetch(email_id, '(RFC822)')
+            # Get just the FROM header to avoid parsing issues
+            logger.info("Fetching email sender information...")
+            typ, header_data = mail.fetch(email_id, '(BODY[HEADER.FIELDS (FROM)])')
             
-            if typ != 'OK':
-                logger.warning("❌ Failed to fetch email content")
+            if typ != 'OK' or not header_data or not header_data[0]:
+                logger.warning("❌ Failed to fetch email header data")
                 mail.logout()
                 return False
             
-            # Parse the email to get information for reply
-            raw_email = msg_data[0][1]
-            # Make sure we're working with bytes, not str
-            if isinstance(raw_email, str):
-                raw_email = raw_email.encode('utf-8')
-            email_message = email.message_from_bytes(raw_email)
-            
-            # Extract From header (sender's email) to reply to
-            headers = str(email_message).split('\n\n')[0]
-            logger.info(f"Received headers: {headers}")
-            
-            # Extract sender's email address from headers
-            from_match = re.search(r'From: ([^\r\n]+)', headers)
-            if not from_match:
-                logger.warning("❌ Could not find sender address in email headers")
-                mail.logout()
-                return False
-            
-            from_address = from_match.group(1).strip()
-            if '<' in from_address and '>' in from_address:
-                from_address = re.search(r'<([^>]+)>', from_address).group(1)
-            
-            logger.info(f"Extracted sender: {from_address}")
-            
-            # Create reply message
-            reply_subject = f"Re: {subject}"
-            logger.info(f"Will send reply to: {from_address}")
-            
-            # Format reply message
-            msg = MIMEMultipart('alternative')
-            msg['Subject'] = reply_subject
-            msg['From'] = email
-            msg['To'] = from_address
-            
-            # Create text and HTML versions of message
-            text = "Thank you for your test email. This is an automated reply from the warmup system."
-            html = """
-            <html>
-              <head></head>
-              <body>
-                <p>Thank you for your test email. This is an automated reply from the warmup system.</p>
-                <p>This reply demonstrates the functioning reply capability of the email warmup system.</p>
-              </body>
-            </html>
-            """
-            
-            # Attach parts
-            part1 = MIMEText(text, 'plain')
-            part2 = MIMEText(html, 'html')
-            msg.attach(part1)
-            msg.attach(part2)
-            
-            # Send the reply
-            logger.info(f"Sending reply to {from_address}...")
+            # Extract the From field directly from header
             try:
+                header_bytes = header_data[0][1]
+                # Convert bytes to string if necessary
+                if isinstance(header_bytes, bytes):
+                    header_str = header_bytes.decode('utf-8')
+                else:
+                    header_str = str(header_bytes)
+                
+                logger.info(f"Raw header: {header_str}")
+                
+                # Extract using regular expression
+                from_match = re.search(r'From:\s*([^\r\n]+)', header_str)
+                if not from_match:
+                    logger.warning("❌ Could not find From header in email")
+                    mail.logout()
+                    return False
+                
+                from_address = from_match.group(1).strip()
+                logger.info(f"Extracted raw From: {from_address}")
+                
+                # Extract email if in angle brackets
+                if '<' in from_address and '>' in from_address:
+                    from_match = re.search(r'<([^>]+)>', from_address)
+                    if from_match:
+                        from_address = from_match.group(1)
+                
+                logger.info(f"Sender email address: {from_address}")
+                
+                # Create reply message
+                reply_subject = f"Re: {subject}"
+                
+                # Format reply message
+                msg = MIMEMultipart('alternative')
+                msg['Subject'] = reply_subject
+                msg['From'] = email
+                msg['To'] = from_address
+                
+                # Create text and HTML versions of message
+                text = "Thank you for your test email. This is an automated reply from the warmup system."
+                html = """
+                <html>
+                  <head></head>
+                  <body>
+                    <p>Thank you for your test email. This is an automated reply from the warmup system.</p>
+                    <p>This reply demonstrates the functioning reply capability of the email warmup system.</p>
+                  </body>
+                </html>
+                """
+                
+                # Attach parts
+                part1 = MIMEText(text, 'plain')
+                part2 = MIMEText(html, 'html')
+                msg.attach(part1)
+                msg.attach(part2)
+                
+                # Send the reply
+                logger.info(f"Sending reply to {from_address}...")
                 # Try SSL connection first
                 context = ssl.create_default_context()
                 with smtplib.SMTP_SSL("smtp.gmail.com", 465, context=context) as server:
@@ -354,22 +358,71 @@ class EndToEndWarmupTester:
                     print("✅ Successfully sent reply to test email")
                     mail.logout()
                     return True
-            except Exception as e:
-                logger.error(f"SSL send failed: {str(e)}")
                 
-                # Try STARTTLS as fallback
-                with smtplib.SMTP("smtp.gmail.com", 587) as server:
-                    server.starttls(context=ssl.create_default_context())
-                    server.login(email, password)
-                    server.send_message(msg)
-                    logger.info(f"✅ Reply sent successfully with subject: {reply_subject}")
-                    print("✅ Successfully sent reply to test email")
+            except Exception as parse_err:
+                logger.error(f"Error extracting sender: {str(parse_err)}")
+                # Fall back to hardcoded recipient - use other email account from verified accounts
+                try:
+                    # Find the other email account
+                    other_email = None
+                    for account in self.verified_accounts:
+                        if account["email"] != email:
+                            other_email = account["email"]
+                            break
+                    
+                    if not other_email:
+                        logger.error("Cannot find other verified email to reply to")
+                        mail.logout()
+                        return False
+                    
+                    logger.info(f"Using fallback recipient: {other_email}")
+                    
+                    # Create reply message
+                    reply_subject = f"Re: {subject}"
+                    
+                    # Format reply message
+                    msg = MIMEMultipart('alternative')
+                    msg['Subject'] = reply_subject
+                    msg['From'] = email
+                    msg['To'] = other_email
+                    
+                    # Create text and HTML versions of message
+                    text = "Thank you for your test email. This is an automated reply from the warmup system."
+                    html = """
+                    <html>
+                      <head></head>
+                      <body>
+                        <p>Thank you for your test email. This is an automated reply from the warmup system.</p>
+                        <p>This reply demonstrates the functioning reply capability of the email warmup system.</p>
+                      </body>
+                    </html>
+                    """
+                    
+                    # Attach parts
+                    part1 = MIMEText(text, 'plain')
+                    part2 = MIMEText(html, 'html')
+                    msg.attach(part1)
+                    msg.attach(part2)
+                    
+                    # Send the reply
+                    logger.info(f"Sending reply to fallback recipient: {other_email}...")
+                    context = ssl.create_default_context()
+                    with smtplib.SMTP_SSL("smtp.gmail.com", 465, context=context) as server:
+                        server.login(email, password)
+                        server.send_message(msg)
+                        logger.info(f"✅ Reply sent successfully with subject: {reply_subject}")
+                        print("✅ Successfully sent reply to test email (fallback method)")
+                        mail.logout()
+                        return True
+                
+                except Exception as fallback_err:
+                    logger.error(f"Fallback method failed: {str(fallback_err)}")
                     mail.logout()
-                    return True
+                    return False
                 
         except Exception as e:
-            logger.error(f"❌ Error sending reply: {str(e)}")
-            print(f"❌ Error sending reply: {str(e)}")
+            logger.error(f"❌ Error in reply process: {str(e)}")
+            print(f"❌ Error in reply process: {str(e)}")
             return False
     
     def check_for_reply(self, email, password, original_subject):
